@@ -14,11 +14,13 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -30,6 +32,7 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	// capture-metrics gzips its responses; registering the codec lets the client decode them.
 	_ "google.golang.org/grpc/encoding/gzip"
@@ -62,6 +65,7 @@ type config struct {
 	ok, bad                      float64
 	interval, duration, flap     time.Duration
 	recoverOnExit, dryRun        bool
+	tls, plaintext               bool
 	hostName                     string
 }
 
@@ -166,16 +170,23 @@ var signalProfiles = map[string]signalProfile{
 			return []*metricspb.Metric{gauge(metric, now, v, dpAttr("state", "used"))}
 		},
 	},
-	// Host CPU utilisation for "High CPU usage for host": the rule sums the busy states
-	// (user/steal/wait/system) ×100. Emitting the whole busy fraction on state=user is enough
-	// to cross; grouped by host.name.
+	// Host CPU utilisation for "High CPU usage for host": the rule is the FORMULA a+b+c+d over
+	// four separate series (state=user/steal/wait/system), ×100 by the runtime. A formula
+	// yields nothing for a host that lacks any of its inputs — not 0, no row — so every state
+	// must be present. The whole busy fraction goes on state=user, the rest are 0. Grouped
+	// by host.name.
 	"host.cpu": {
 		metric: "system.cpu.utilization",
 		ok:     0.02,
 		bad:    0.92,
 		attrs:  hostAttrs,
 		metrics: func(metric string, v float64, _ int, now time.Time) []*metricspb.Metric {
-			return []*metricspb.Metric{gauge(metric, now, v, dpAttr("state", "user"))}
+			return []*metricspb.Metric{
+				gauge(metric, now, v, dpAttr("state", "user")),
+				gauge(metric, now, 0, dpAttr("state", "steal")),
+				gauge(metric, now, 0, dpAttr("state", "wait")),
+				gauge(metric, now, 0, dpAttr("state", "system")),
+			}
 		},
 	},
 	// Node CPU for "High CPU utilization for node": the rule is a/b*100 where a =
@@ -362,9 +373,30 @@ func send(ctx context.Context, client collectormetrics.MetricsServiceClient, cfg
 	return bytes, time.Since(start), nil
 }
 
+// normalizeEndpoint turns "https://host:443", "http://host:4321" or "host:4321" into a bare
+// host:port plus whether TLS is implied. A bare host:443 is assumed to be TLS too, since no
+// ingest gateway serves plaintext gRPC there.
+func normalizeEndpoint(ep string) (string, bool) {
+	switch {
+	case strings.HasPrefix(ep, "https://"):
+		return defaultPort(strings.TrimSuffix(strings.TrimPrefix(ep, "https://"), "/"), "443"), true
+	case strings.HasPrefix(ep, "http://"):
+		return strings.TrimSuffix(strings.TrimPrefix(ep, "http://"), "/"), false
+	}
+	_, port, err := net.SplitHostPort(ep)
+	return ep, err == nil && port == "443"
+}
+
+func defaultPort(hostport, port string) string {
+	if _, _, err := net.SplitHostPort(hostport); err != nil {
+		return net.JoinHostPort(hostport, port)
+	}
+	return hostport
+}
+
 func main() {
 	var cfg config
-	flag.StringVar(&cfg.endpoint, "endpoint", "127.0.0.1:4321", "capture-metrics OTLP gRPC endpoint (plaintext)")
+	flag.StringVar(&cfg.endpoint, "endpoint", "127.0.0.1:4321", "OTLP gRPC endpoint; accepts host:port or a https://host:port URL")
 	flag.StringVar(&cfg.apiKey, "api-key", os.Getenv("MW_API_KEY"), "project API key (or MW_API_KEY)")
 	flag.StringVar(&cfg.authHeader, "auth-header", "authorization", "gRPC metadata key carrying the API key")
 	flag.StringVar(&cfg.signal, "signal", "container", "what to synthesise: container | k8s.pod | host.memory | host.cpu | k8s.node | k8s.container")
@@ -381,6 +413,8 @@ func main() {
 	flag.DurationVar(&cfg.duration, "duration", 0, "stop after this long (0 = until Ctrl-C)")
 	flag.DurationVar(&cfg.flap, "flap", 0, "rotate which containers breach every this often (0 = never)")
 	flag.BoolVar(&cfg.recoverOnExit, "recover-on-exit", true, "send a final all-healthy batch on exit so groups resolve")
+	flag.BoolVar(&cfg.tls, "tls", false, "force TLS (auto-enabled for https:// endpoints and port 443)")
+	flag.BoolVar(&cfg.plaintext, "plaintext", false, "force plaintext, overriding the TLS auto-detection")
 	flag.BoolVar(&cfg.dryRun, "dry-run", false, "print the first batch as JSON and exit without sending")
 	flag.Parse()
 
@@ -422,7 +456,25 @@ func main() {
 		log.Fatal("no API key: pass -api-key or set MW_API_KEY")
 	}
 
-	conn, err := grpc.NewClient(cfg.endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// A remote ingest endpoint is a URL on :443; the local capture-metrics is plain host:port.
+	// Strip any scheme (grpc.NewClient wants host:port) and turn TLS on when the endpoint says
+	// so, unless -tls / -plaintext overrides it.
+	target, useTLS := normalizeEndpoint(cfg.endpoint)
+	switch {
+	case cfg.plaintext:
+		useTLS = false
+	case cfg.tls:
+		useTLS = true
+	}
+	creds := insecure.NewCredentials()
+	if useTLS {
+		host := target
+		if h, _, err := net.SplitHostPort(target); err == nil {
+			host = h
+		}
+		creds = credentials.NewTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+	}
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		log.Fatalf("grpc: %v", err)
 	}
@@ -438,7 +490,11 @@ func main() {
 	}
 
 	summary, _ := json.Marshal(map[string]any{"n": cfg.n, "breach": cfg.breach, "hosts": cfg.hosts, "churn": cfg.churn, "flap": cfg.flap.String(), "interval": cfg.interval.String(), "metric": cfg.metric, "prefix": cfg.prefix})
-	log.Printf("start %s -> %s", summary, cfg.endpoint)
+	scheme := "plaintext"
+	if useTLS {
+		scheme = "tls"
+	}
+	log.Printf("start %s -> %s (%s)", summary, target, scheme)
 
 	ticker := time.NewTicker(cfg.interval)
 	defer ticker.Stop()
