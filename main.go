@@ -9,6 +9,10 @@
 // Docker container (captured from a live row); the pipeline derives type=container from
 // the presence of container.id, and uniq_cpu_core falls back to 1 for hosts with no CPU
 // metrics, so the fake hosts need nothing else.
+//
+// One signal is not a metric at all. APM latency lives in the spans table, so the
+// trace.service profile emits ResourceSpans instead — same batch loop, same chunking,
+// the traces service rather than the metrics one.
 package main
 
 import (
@@ -28,9 +32,11 @@ import (
 	"time"
 
 	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -62,6 +68,7 @@ type config struct {
 	endpoint, apiKey, authHeader string
 	signal, metric, prefix       string
 	n, breach, hosts, churn      int
+	clusters, spans              int
 	ok, bad                      float64
 	interval, duration, flap     time.Duration
 	recoverOnExit, dryRun        bool
@@ -91,6 +98,12 @@ func kv(k, v string) *commonpb.KeyValue {
 	return &commonpb.KeyValue{Key: k, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}}}
 }
 
+// kvInt is the same for the handful of span attributes that are numbers on the wire
+// (http.response.status_code), where a string would be the wrong type to filter on.
+func kvInt(k string, v int64) *commonpb.KeyValue {
+	return &commonpb.KeyValue{Key: k, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: v}}}
+}
+
 // signalProfile is one kind of thing to synthesise: which metric it emits, sensible healthy
 // and breaching values, and how to build one resource's attributes so the pipeline derives the
 // right resource type. Adding a metric to test is adding a profile here.
@@ -105,6 +118,10 @@ type signalProfile struct {
 	// (seq, for counters). nil = one gauge of `metric` with `value`. A profile can emit
 	// several metrics (a formula) or attach datapoint attributes (a pinned state).
 	metrics func(metric string, value float64, seq int, now time.Time) []*metricspb.Metric
+	// spans, when set, makes this a TRACE profile: the tick builds one ResourceSpans per
+	// entity from these instead of a ResourceMetrics, and the batch goes to the traces
+	// service. `value` is then milliseconds of request duration, not a gauge reading.
+	spans func(cfg config, c container, value float64, seq int, now time.Time) []*tracepb.Span
 }
 
 // dpAttr is a datapoint attribute (e.g. state=used), how the agent pins a metric to a state.
@@ -153,9 +170,9 @@ var signalProfiles = map[string]signalProfile{
 				kv("k8s.pod.name", pod),
 				kv("k8s.pod.start_time", fmt.Sprint(startedOn)),
 				kv("k8s.namespace.name", host),
-				kv("k8s.cluster.name", cfg.prefix+"-cluster"),
-				kv("k8s.node.name", cfg.prefix+"-node-01"),
-				kv("host.name", cfg.prefix+"-node-01"),
+				kv("k8s.cluster.name", clusterFor(cfg, c)),
+				kv("k8s.node.name", nodeFor(cfg, c)),
+				kv("host.name", nodeFor(cfg, c)),
 			}
 		},
 	},
@@ -201,7 +218,7 @@ var signalProfiles = map[string]signalProfile{
 			return []*commonpb.KeyValue{
 				kv("k8s.node.uid", c.id(cfg.prefix)),
 				kv("k8s.node.name", node),
-				kv("k8s.cluster.name", cfg.prefix+"-cluster"),
+				kv("k8s.cluster.name", clusterFor(cfg, c)),
 				kv("host.id", node),
 				kv("host.name", node),
 			}
@@ -229,9 +246,9 @@ var signalProfiles = map[string]signalProfile{
 				kv("k8s.container.name", ctr),
 				kv("k8s.pod.name", cfg.prefix+"-pod-"+fmt.Sprintf("%04d", c.idx+1)),
 				kv("k8s.namespace.name", host),
-				kv("k8s.cluster.name", cfg.prefix+"-cluster"),
-				kv("k8s.node.name", cfg.prefix+"-node-01"),
-				kv("host.name", cfg.prefix+"-node-01"),
+				kv("k8s.cluster.name", clusterFor(cfg, c)),
+				kv("k8s.node.name", nodeFor(cfg, c)),
+				kv("host.name", nodeFor(cfg, c)),
 			}
 		},
 		metrics: func(metric string, v float64, seq int, now time.Time) []*metricspb.Metric {
@@ -243,6 +260,106 @@ var signalProfiles = map[string]signalProfile{
 			}
 		},
 	},
+	// Service latency for "Latency is higher than expected". This rule reads the APM spans
+	// table, not a metric — a service's latency IS the duration of the requests it served —
+	// so this profile emits TRACES. Every interval each service serves cfg.spans requests,
+	// each a root SERVER span of `value` MILLISECONDS with a slow database CLIENT child
+	// inside it, so the trace view shows a cause and not just a slow box. Grouped by
+	// service.name; here "host" is the machine the service runs on, spread over cfg.hosts.
+	"trace.service": {
+		metric: "trace.duration.ms",
+		ok:     45,   // 45 ms — a request nobody would notice
+		bad:    4000, // 4 s — MILLISECONDS, not a percent and not a fraction
+		attrs: func(cfg config, c container, host string, _ int64) []*commonpb.KeyValue {
+			svc := c.name(cfg.prefix, "service")
+			return []*commonpb.KeyValue{
+				kv("service.name", svc),
+				kv("service.version", "1.0.0"),
+				kv("service.instance.id", c.id(cfg.prefix)),
+				kv("deployment.environment", "synthetic"),
+				kv("telemetry.sdk.name", "opentelemetry"),
+				kv("telemetry.sdk.language", "go"),
+				kv("telemetry.sdk.version", "1.38.0"),
+				kv("mw.app.lang", "go"),
+				// The host the service runs on. No host.id: these are not hosts, and a
+				// host.id would mint 200 phantom host entities carrying no host metrics.
+				kv("host.name", host),
+				kv("os.type", "linux"),
+			}
+		},
+		spans: spansFor,
+	},
+}
+
+// routes are the endpoints a synthetic service serves. Several of them, so the APM view
+// has a resource breakdown to open up rather than one undifferentiated blob.
+var routes = []struct{ name, method, route, path, table string }{
+	{"GET /api/orders", "GET", "/api/orders", "/api/orders", "orders"},
+	{"GET /api/orders/{id}", "GET", "/api/orders/{id}", "/api/orders/4711", "orders"},
+	{"POST /api/checkout", "POST", "/api/checkout", "/api/checkout", "carts"},
+	{"GET /api/inventory", "GET", "/api/inventory", "/api/inventory", "inventory"},
+}
+
+// spansFor builds one service's requests for this interval: cfg.spans root SERVER spans of
+// `ms` milliseconds each, every one with a CLIENT child holding 80% of that time.
+//
+// Two things here are deliberate. The duration jitters only ±8%, so avg, p50, p90 and p99
+// all land on essentially the same number — whichever aggregation the rule actually uses,
+// it sees a slow service. And the ids are hashed from prefix|idx|gen|seq|k rather than
+// drawn from an RNG, so every request in a run has a unique trace without seeding anything.
+func spansFor(cfg config, c container, ms float64, seq int, now time.Time) []*tracepb.Span {
+	out := make([]*tracepb.Span, 0, cfg.spans*2)
+	for k := 0; k < cfg.spans; k++ {
+		r := routes[(c.idx+k)%len(routes)]
+		dur := time.Duration(ms * (0.92 + 0.16*float64((seq*7+k*13)%17)/16) * float64(time.Millisecond))
+		// Stagger the requests back across the interval so a service's traffic is spread
+		// through the bucket instead of arriving as one spike on the tick.
+		end := now.Add(-time.Duration(k) * cfg.interval / time.Duration(cfg.spans))
+		start := end.Add(-dur)
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d|%d|%d", cfg.prefix, c.idx, c.gen, seq, k)))
+		traceID, rootID, childID := sum[0:16], sum[16:24], sum[24:32]
+		out = append(out,
+			&tracepb.Span{
+				TraceId:           traceID,
+				SpanId:            rootID,
+				Name:              r.name,
+				Kind:              tracepb.Span_SPAN_KIND_SERVER,
+				StartTimeUnixNano: uint64(start.UnixNano()),
+				EndTimeUnixNano:   uint64(end.UnixNano()),
+				Attributes: []*commonpb.KeyValue{
+					kv("http.request.method", r.method),
+					kv("http.route", r.route),
+					kv("url.path", r.path),
+					kv("url.scheme", "http"),
+					kvInt("http.response.status_code", 200),
+					kv("network.protocol.version", "1.1"),
+				},
+				Status: &tracepb.Status{Code: tracepb.Status_STATUS_CODE_OK},
+			},
+			// The child is where the time actually goes. It is a CLIENT span, so a rule
+			// that looks at root or SERVER spans only still sees the full `ms`.
+			&tracepb.Span{
+				TraceId:           traceID,
+				SpanId:            childID,
+				ParentSpanId:      rootID,
+				Name:              "SELECT " + r.table,
+				Kind:              tracepb.Span_SPAN_KIND_CLIENT,
+				StartTimeUnixNano: uint64(start.Add(dur / 10).UnixNano()),
+				EndTimeUnixNano:   uint64(end.Add(-dur / 10).UnixNano()),
+				Attributes: []*commonpb.KeyValue{
+					kv("db.system", "postgresql"),
+					kv("db.name", "shop"),
+					kv("db.operation", "SELECT"),
+					kv("db.sql.table", r.table),
+					kv("db.statement", "SELECT * FROM "+r.table+" WHERE tenant_id = $1"),
+					kv("server.address", "shop-db-01"),
+					kvInt("server.port", 5432),
+				},
+				Status: &tracepb.Status{Code: tracepb.Status_STATUS_CODE_OK},
+			},
+		)
+	}
+	return out
 }
 
 // hostAttrs builds a host resource (type derived from host.id), grouped by host.name.
@@ -261,16 +378,40 @@ func hostAttrs(cfg config, c container, _ string, startedOn int64) []*commonpb.K
 	return attrs
 }
 
+// clusterFor spreads k8s entities across cfg.clusters synthetic clusters. The k8s rules
+// group by k8s.cluster.name alongside the pod/container name, so more clusters means more
+// distinct group keys inside the one notification.
+func clusterFor(cfg config, c container) string {
+	if cfg.clusters <= 1 {
+		return cfg.prefix + "-cluster"
+	}
+	return fmt.Sprintf("%s-cluster-%02d", cfg.prefix, (c.idx%cfg.clusters)+1)
+}
+
+// nodeFor keeps a node inside exactly one cluster — a node shared between clusters would be
+// a shape the real pipeline never sees.
+func nodeFor(cfg config, c container) string {
+	return clusterFor(cfg, c) + "-node-01"
+}
+
 func resourceFor(cfg config, c container, startedOn int64) *resourcepb.Resource {
 	// The parent bucket each entity belongs to (a host for containers, a namespace for pods),
 	// spread across cfg.hosts.
+	// For trace.service the bucket is the machine the service runs on, so "host" again.
 	bucketWord := "host"
-	if cfg.signal == "k8s.pod" {
+	if cfg.signal == "k8s.pod" || cfg.signal == "k8s.container" {
 		bucketWord = "ns"
 	}
 	host := fmt.Sprintf("%s-%s-01", cfg.prefix, bucketWord)
 	if cfg.hosts > 1 {
-		host = fmt.Sprintf("%s-%s-%02d", cfg.prefix, bucketWord, (c.idx%cfg.hosts)+1)
+		// Divide out the cluster assignment first, otherwise idx%clusters and idx%hosts
+		// move together and the cross-product collapses onto a diagonal (cluster 1 only
+		// ever pairs with namespace 1, and so on).
+		idx := c.idx
+		if cfg.clusters > 1 {
+			idx = c.idx / cfg.clusters
+		}
+		host = fmt.Sprintf("%s-%s-%02d", cfg.prefix, bucketWord, (idx%cfg.hosts)+1)
 	}
 	return &resourcepb.Resource{Attributes: signalProfiles[cfg.signal].attrs(cfg, c, host, startedOn)}
 }
@@ -323,9 +464,32 @@ func (g *generator) metricsFor(v float64, now time.Time) []*metricspb.Metric {
 	return []*metricspb.Metric{gauge(g.cfg.metric, now, v)}
 }
 
+// batch is one interval's worth of telemetry. A metric profile fills in metrics, a trace
+// profile fills in traces; exactly one is ever set. Both are per-resource lists, so the
+// chunking in send and the counts in the log line read the same either way.
+type batch struct {
+	metrics *collectormetrics.ExportMetricsServiceRequest
+	traces  *collectortrace.ExportTraceServiceRequest
+	bad     int
+}
+
+func (b *batch) resources() int {
+	if b.traces != nil {
+		return len(b.traces.ResourceSpans)
+	}
+	return len(b.metrics.ResourceMetrics)
+}
+
+func (b *batch) message() proto.Message {
+	if b.traces != nil {
+		return b.traces
+	}
+	return b.metrics
+}
+
 // tick advances the scenario clock: rotate the breaching window on flap, retire churn
 // containers, then build the batch.
-func (g *generator) tick(now time.Time, allOK bool) (*collectormetrics.ExportMetricsServiceRequest, int) {
+func (g *generator) tick(now time.Time, allOK bool) *batch {
 	g.seq++
 	if g.cfg.flap > 0 && !now.Before(g.nextFlap) {
 		g.breachAt = (g.breachAt + g.cfg.breach) % g.cfg.n
@@ -335,38 +499,77 @@ func (g *generator) tick(now time.Time, allOK bool) (*collectormetrics.ExportMet
 		g.containers[g.churnAt].gen++
 		g.churnAt = (g.churnAt + 1) % g.cfg.n
 	}
-	req := &collectormetrics.ExportMetricsServiceRequest{}
-	bad := 0
+	profile := signalProfiles[g.cfg.signal]
+	b := &batch{}
+	if profile.spans != nil {
+		b.traces = &collectortrace.ExportTraceServiceRequest{}
+	} else {
+		b.metrics = &collectormetrics.ExportMetricsServiceRequest{}
+	}
 	for i, c := range g.containers {
 		v := g.cfg.ok
 		if !allOK && g.breaching(i) {
 			v = g.cfg.bad
-			bad++
+			b.bad++
 		}
-		req.ResourceMetrics = append(req.ResourceMetrics, &metricspb.ResourceMetrics{
-			Resource: resourceFor(g.cfg, c, g.startedOn),
+		res := resourceFor(g.cfg, c, g.startedOn)
+		if profile.spans != nil {
+			b.traces.ResourceSpans = append(b.traces.ResourceSpans, &tracepb.ResourceSpans{
+				Resource: res,
+				ScopeSpans: []*tracepb.ScopeSpans{{
+					Scope: &commonpb.InstrumentationScope{Name: "telemetrygen"},
+					Spans: profile.spans(g.cfg, c, v, g.seq, now),
+				}},
+			})
+			continue
+		}
+		b.metrics.ResourceMetrics = append(b.metrics.ResourceMetrics, &metricspb.ResourceMetrics{
+			Resource: res,
 			ScopeMetrics: []*metricspb.ScopeMetrics{{
 				Scope:   &commonpb.InstrumentationScope{Name: "telemetrygen"},
 				Metrics: g.metricsFor(v, now),
 			}},
 		})
 	}
-	return req, bad
+	return b
+}
+
+// clients holds both OTLP services on the one connection; a batch goes to whichever one
+// its signal produced.
+type clients struct {
+	metrics collectormetrics.MetricsServiceClient
+	traces  collectortrace.TraceServiceClient
 }
 
 // send splits a batch into requests of at most 1000 resources — well under gRPC's 4 MB
-// default — so -n 50000 is one tick, not one giant message.
-func send(ctx context.Context, client collectormetrics.MetricsServiceClient, cfg config, req *collectormetrics.ExportMetricsServiceRequest) (int, time.Duration, error) {
+// default — so -n 50000 is one tick, not one giant message. A trace resource carries
+// cfg.spans*2 spans rather than a handful of datapoints, so its chunk is sized to land on
+// roughly the same 2000 sub-records instead.
+func send(ctx context.Context, cl clients, cfg config, b *batch) (int, time.Duration, error) {
 	ctx = metadata.AppendToOutgoingContext(ctx, cfg.authHeader, cfg.apiKey)
-	all := req.ResourceMetrics
 	bytes := 0
 	start := time.Now()
+	if b.traces != nil {
+		per := max(1, 2000/max(1, cfg.spans*2))
+		all := b.traces.ResourceSpans
+		for len(all) > 0 {
+			n := min(per, len(all))
+			chunk := &collectortrace.ExportTraceServiceRequest{ResourceSpans: all[:n]}
+			all = all[n:]
+			bytes += proto.Size(chunk)
+			if _, err := cl.traces.Export(ctx, chunk); err != nil {
+				return bytes, time.Since(start), err
+			}
+		}
+		return bytes, time.Since(start), nil
+	}
+	all := b.metrics.ResourceMetrics
 	for len(all) > 0 {
 		n := min(1000, len(all))
 		chunk := &collectormetrics.ExportMetricsServiceRequest{ResourceMetrics: all[:n]}
 		all = all[n:]
 		bytes += proto.Size(chunk)
-		if _, err := client.Export(ctx, chunk); err != nil {
+		if _, err := cl.metrics.Export(ctx, chunk); err != nil {
 			return bytes, time.Since(start), err
 		}
 	}
@@ -399,13 +602,15 @@ func main() {
 	flag.StringVar(&cfg.endpoint, "endpoint", "127.0.0.1:4321", "OTLP gRPC endpoint; accepts host:port or a https://host:port URL")
 	flag.StringVar(&cfg.apiKey, "api-key", os.Getenv("MW_API_KEY"), "project API key (or MW_API_KEY)")
 	flag.StringVar(&cfg.authHeader, "auth-header", "authorization", "gRPC metadata key carrying the API key")
-	flag.StringVar(&cfg.signal, "signal", "container", "what to synthesise: container | k8s.pod | host.memory | host.cpu | k8s.node | k8s.container")
+	flag.StringVar(&cfg.signal, "signal", "container", "what to synthesise: container | k8s.pod | host.memory | host.cpu | k8s.node | k8s.container | trace.service")
 	flag.StringVar(&cfg.metric, "metric", "container.cpu.utilization", "metric name to emit")
 	flag.StringVar(&cfg.prefix, "prefix", "synth", "name prefix for containers and hosts")
 	flag.StringVar(&cfg.hostName, "host-name", "synth-host-01", "host.name when -hosts is 1")
 	flag.IntVar(&cfg.n, "n", 500, "number of synthetic containers (groups)")
 	flag.IntVar(&cfg.breach, "breach", 0, "how many of them emit the -bad value")
-	flag.IntVar(&cfg.hosts, "hosts", 1, "spread containers across this many synthetic hosts")
+	flag.IntVar(&cfg.hosts, "hosts", 1, "spread entities across this many synthetic hosts (namespaces, for k8s.pod / k8s.container)")
+	flag.IntVar(&cfg.clusters, "clusters", 1, "spread k8s entities across this many synthetic clusters")
+	flag.IntVar(&cfg.spans, "spans", 4, "trace signals only: requests each service serves per interval (each is a root span plus a child)")
 	flag.IntVar(&cfg.churn, "churn", 0, "retire and re-mint this many containers every interval (new group names)")
 	flag.Float64Var(&cfg.ok, "ok", 2, "value for healthy containers (percent; container.cpu.utilization is already percent on the wire)")
 	flag.Float64Var(&cfg.bad, "bad", 95, "value for breaching containers (percent)")
@@ -443,13 +648,16 @@ func main() {
 	if cfg.breach > cfg.n {
 		log.Fatalf("-breach %d exceeds -n %d", cfg.breach, cfg.n)
 	}
+	if cfg.spans <= 0 {
+		log.Fatal("-spans must be > 0")
+	}
 	g := newGenerator(cfg, time.Now())
 
 	if cfg.dryRun {
-		req, bad := g.tick(time.Now(), false)
-		out, _ := protojson.MarshalOptions{Multiline: true}.Marshal(req)
+		b := g.tick(time.Now(), false)
+		out, _ := protojson.MarshalOptions{Multiline: true}.Marshal(b.message())
 		fmt.Println(string(out))
-		log.Printf("dry run: %d resources, %d breaching, %d bytes", len(req.ResourceMetrics), bad, proto.Size(req))
+		log.Printf("dry run: %d resources, %d breaching, %d bytes", b.resources(), b.bad, proto.Size(b.message()))
 		return
 	}
 	if cfg.apiKey == "" {
@@ -479,7 +687,10 @@ func main() {
 		log.Fatalf("grpc: %v", err)
 	}
 	defer conn.Close()
-	client := collectormetrics.NewMetricsServiceClient(conn)
+	cl := clients{
+		metrics: collectormetrics.NewMetricsServiceClient(conn),
+		traces:  collectortrace.NewTraceServiceClient(conn),
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -489,7 +700,11 @@ func main() {
 		defer cancel()
 	}
 
-	summary, _ := json.Marshal(map[string]any{"n": cfg.n, "breach": cfg.breach, "hosts": cfg.hosts, "churn": cfg.churn, "flap": cfg.flap.String(), "interval": cfg.interval.String(), "metric": cfg.metric, "prefix": cfg.prefix})
+	fields := map[string]any{"n": cfg.n, "breach": cfg.breach, "hosts": cfg.hosts, "clusters": cfg.clusters, "churn": cfg.churn, "flap": cfg.flap.String(), "interval": cfg.interval.String(), "metric": cfg.metric, "prefix": cfg.prefix}
+	if profile.spans != nil {
+		fields["spans"] = cfg.spans
+	}
+	summary, _ := json.Marshal(fields)
 	scheme := "plaintext"
 	if useTLS {
 		scheme = "tls"
@@ -499,13 +714,13 @@ func main() {
 	ticker := time.NewTicker(cfg.interval)
 	defer ticker.Stop()
 	emit := func(now time.Time, allOK bool) {
-		req, bad := g.tick(now, allOK)
-		bytes, took, err := send(context.Background(), client, cfg, req)
+		b := g.tick(now, allOK)
+		bytes, took, err := send(context.Background(), cl, cfg, b)
 		status := "ok"
 		if err != nil {
 			status = "ERROR " + strings.TrimSpace(err.Error())
 		}
-		log.Printf("batch resources=%d breaching=%d bytes=%d took=%s %s", len(req.ResourceMetrics), bad, bytes, took.Round(time.Millisecond), status)
+		log.Printf("batch resources=%d breaching=%d bytes=%d took=%s %s", b.resources(), b.bad, bytes, took.Round(time.Millisecond), status)
 	}
 	emit(time.Now(), false)
 	for {

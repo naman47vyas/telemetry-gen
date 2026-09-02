@@ -74,7 +74,8 @@ run_alert() {
   WATCH     : rule "$ALERT"  ->  Alerts > History
   entities  : $n, all breaching
   prefix    : $prefix
-  values    : healthy $OK, breaching $BAD
+  values    : healthy $OK, breaching $BAD${SPREAD:+
+  spread    : $SPREAD}
   note      : $NOTE
   duration  : $duration  (interval $INTERVAL)
   endpoint  : $ENDPOINT

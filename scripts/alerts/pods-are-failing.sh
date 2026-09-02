@@ -12,5 +12,13 @@ OK=2               # Running
 BAD=4              # Failed
 NOTE="k8s.pod.phase is an enum (2=Running, 4=Failed), not a percent — crit is > 3"
 
+# Spread the entities over a cluster x namespace grid. The rule groups by
+# cluster + namespace + pod + container, so this widens the group keys inside the single
+# notification rather than adding more notifications.
+CLUSTERS=${CLUSTERS:-3}
+NAMESPACES=${NAMESPACES:-5}
+EXTRA=(-clusters "$CLUSTERS" -hosts "$NAMESPACES")
+SPREAD="$CLUSTERS clusters x $NAMESPACES namespaces"
+
 parse_args "$@"
 run_alert

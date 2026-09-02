@@ -13,6 +13,24 @@ stands for many resources.
 
 `N` and `DURATION` may also be passed as environment variables.
 
+The latency script is APM rather than infrastructure, so `N` is a number of *services*:
+
+```sh
+./latency-is-higher-than-expected.sh            # 200 services, every request ~4 s
+SPANS=10 ./latency-is-higher-than-expected.sh   # 10 requests per service per interval
+```
+
+The three Kubernetes scripts spread their entities over several clusters, and the two pod
+scripts over several namespaces too, so one notification carries group keys from across
+the estate rather than from a single cluster:
+
+```sh
+CLUSTERS=4 NAMESPACES=6 ./pods-are-restarting.sh 240
+```
+
+Entities are dealt across the full cluster x namespace grid, not down a diagonal, and each
+synthetic node belongs to exactly one cluster. Defaults are 3 clusters and 5 namespaces.
+
 | Script | Rule it fires | Grouped by |
 |---|---|---|
 | `high-cpu-usage-for-host.sh` | High CPU usage for host | `host.name` |
@@ -22,6 +40,7 @@ stands for many resources.
 | `pods-are-restarting.sh` | Pods are restarting (and CrashloopBackoff) | cluster + ns + pod + container |
 | `high-container-cpu.sh` | High Container CPU | `host.name` + `container.name` |
 | `container-is-not-running.sh` | Container is not running | `container.name` |
+| `latency-is-higher-than-expected.sh` | Latency is higher than expected | `service.name` |
 
 ## Credentials
 
@@ -41,6 +60,12 @@ for `https://` and for port 443; the local `127.0.0.1:4321` capture stays plaint
 breaching series on its chart and writes nothing to the history table. This looks exactly
 like a data problem and is not one.
 
+**One of these is traces, not metrics.** "Latency is higher than expected" reads the APM
+spans table — a service's latency is how long its requests took, so there is no gauge to
+pin. `latency-is-higher-than-expected.sh` emits root SERVER spans (each with a slow
+database child) and its `OK`/`BAD` are **milliseconds of request duration**. Everything
+else in this directory emits metrics.
+
 **Values are not all the same scale.** `system.cpu.utilization` and
 `system.memory.utilization` are *fractions* (0.95 = 95%). `container.cpu.utilization` is
 already a percent. `k8s.pod.phase` and `container.status` are enums. Each script says
@@ -54,6 +79,12 @@ emits all four states.
 **A counter rule needs the value to climb.** "Pods are restarting" diffs
 `k8s.container.restarts` over its window, so a flat high number never breaches. The
 script ramps it every tick.
+
+**A latency rule needs requests, not just slow ones.** A service that emits nothing is not
+a fast service, it is an absent one, and an APM rule has no row to evaluate. The latency
+script keeps every service sending `SPANS` requests per interval throughout the run, and
+on exit switches them to 45 ms rather than stopping — which is what makes the alert
+resolve instead of going stale.
 
 **Breach for longer than the rule's window.** The window is on the rule
 (5 minutes for the host rules, longer for restarts). The defaults here are comfortably

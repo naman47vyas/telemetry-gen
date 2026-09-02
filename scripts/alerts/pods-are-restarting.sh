@@ -17,5 +17,13 @@ OK=0               # never restarts
 BAD=3              # +3 restarts per tick, so the windowed difference climbs fast
 NOTE="restarts is a counter; the rule diffs over its window, so the value must RAMP"
 
+# Spread the entities over a cluster x namespace grid. The rule groups by
+# cluster + namespace + pod + container, so this widens the group keys inside the single
+# notification rather than adding more notifications.
+CLUSTERS=${CLUSTERS:-3}
+NAMESPACES=${NAMESPACES:-5}
+EXTRA=(-clusters "$CLUSTERS" -hosts "$NAMESPACES")
+SPREAD="$CLUSTERS clusters x $NAMESPACES namespaces"
+
 parse_args "$@"
 run_alert

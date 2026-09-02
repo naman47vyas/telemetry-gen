@@ -13,5 +13,11 @@ OK=10              # 10%
 BAD=96             # PERCENT, because allocatable_cpu is emitted as 100
 NOTE="cpu.utilization / allocatable_cpu * 100, with allocatable pinned to 100"
 
+# The rule groups by cluster + node, so spreading the nodes over several clusters widens
+# the group keys. Namespaces do not apply to a node-level metric.
+CLUSTERS=${CLUSTERS:-3}
+EXTRA=(-clusters "$CLUSTERS")
+SPREAD="$CLUSTERS clusters"
+
 parse_args "$@"
 run_alert
