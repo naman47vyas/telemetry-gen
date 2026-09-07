@@ -12,13 +12,19 @@
 # whichever aggregation the rule is configured with, it sees the same slow service. The
 # child CLIENT span holds 80% of the time, so a rule that counts root or SERVER spans
 # only still measures the full BAD.
+#
+# The group is split by severity: two thirds of the entities sit at BAD (critical) and the
+# rest at WARN, which is over the rule's warning threshold but under its critical one, so
+# one notification carries both severities. WARN_N moves the line; WARN_N=0 makes the whole
+# cohort critical again.
 . "$(dirname "$0")/_common.sh"
 
 ALERT="Latency is higher than expected"
 TAG=lat
 SIGNAL=trace.service
-OK=45              # 45 ms — a request nobody would notice
-BAD=4000           # MILLISECONDS: 4000 = a 4 second request
+OK=${OK:-45}        # 45 ms — a request nobody would notice
+BAD=${BAD:-4000}    # MILLISECONDS: 4000 = a 4 second request
+WARN=${WARN:-900}   # MILLISECONDS: 0.9 s — slow enough to complain about, not to page
 NOTE="values are MILLISECONDS of request duration; 4000 = a 4 s request"
 
 # Traffic shape. The rule groups by service, so N is the number of services; SPANS is how

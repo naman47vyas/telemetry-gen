@@ -1,2 +1,5 @@
 .multi-alert-runs/
-.env.beta
+# One env file per project (.env.beta, .env.prod, …). Never commit one; the .example
+# template is the only .env file that belongs in the repo.
+.env.*
+!.env.*.example

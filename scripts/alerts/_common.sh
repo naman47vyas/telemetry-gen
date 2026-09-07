@@ -14,21 +14,43 @@ BIN="$REPO/telemetrygen"
 RUN_DIR="${MA_RUN_DIR:-$REPO/.multi-alert-runs}"
 
 # ---------------------------------------------------------------- credentials / target
-# .env.beta (gitignored) is the convenient place to keep MW_API_KEY and MW_OTLP_ENDPOINT.
-# Anything already exported wins, so `MW_API_KEY=… ./pods-are-failing.sh` still works.
-if [[ -f $REPO/.env.beta ]]; then
-  # shellcheck disable=SC1091
-  { set -a; . "$REPO/.env.beta"; set +a; }
+# MW_API_KEY and MW_OTLP_ENDPOINT decide WHICH PROJECT a run lands in. They come from an
+# env file at the repo root — .env.beta by default, or whichever one MW_ENV_FILE names, so
+# a second project is a second file and not an edit:
+#
+#   cp .env.beta .env.prod && $EDITOR .env.prod
+#   MW_ENV_FILE=.env.prod ./pods-are-failing.sh
+#
+# Anything already exported wins over the file, so a one-off
+# `MW_API_KEY=… MW_OTLP_ENDPOINT=… ./pods-are-failing.sh` works too. That is what the
+# save/restore below is for: the env files say `export MW_API_KEY=…`, which plain sourcing
+# would slam straight over the top of whatever the caller set.
+ENV_FILE="${MW_ENV_FILE:-.env.beta}"
+[[ $ENV_FILE == /* ]] || ENV_FILE="$REPO/$ENV_FILE"
+shell_key=${MW_API_KEY:-}
+shell_endpoint=${MW_OTLP_ENDPOINT:-}
+if [[ -f $ENV_FILE ]]; then
+  # shellcheck disable=SC1090,SC1091
+  { set -a; . "$ENV_FILE"; set +a; }
+elif [[ -n ${MW_ENV_FILE:-} ]]; then
+  # Named a file explicitly and it is not there: almost certainly a typo, and silently
+  # falling back would send the run to whatever project the shell happened to hold.
+  echo "ERROR: MW_ENV_FILE=$MW_ENV_FILE not found (looked for $ENV_FILE)" >&2
+  exit 1
 fi
+[[ -n $shell_key ]] && MW_API_KEY=$shell_key
+[[ -n $shell_endpoint ]] && MW_OTLP_ENDPOINT=$shell_endpoint
+export MW_API_KEY
 
 ENDPOINT="${MW_OTLP_ENDPOINT:-127.0.0.1:4321}"
 INTERVAL="${MA_INTERVAL:-10s}"
 
 if [[ -z ${MW_API_KEY:-} ]]; then
   echo "ERROR: MW_API_KEY is not set." >&2
-  echo "  export it, or put it in $REPO/.env.beta:" >&2
+  echo "  export it, or put it in $ENV_FILE:" >&2
   echo "    MW_API_KEY=…" >&2
   echo "    MW_OTLP_ENDPOINT=https://<tenant>.middleware.io:443" >&2
+  echo "  another project's file: MW_ENV_FILE=.env.prod $(basename "$0")" >&2
   exit 1
 fi
 
@@ -53,7 +75,25 @@ mk_prefix() { printf 'ma-%s-%d%02d' "$1" "$(( $(date +%s) % 1000000 ))" "$(( RAN
 #   SIGNAL    telemetrygen -signal
 #   OK BAD    healthy / breaching values
 #   NOTE      one line explaining the value scale (percent vs fraction vs enum)
-# Optional: METRIC, EXTRA (array of extra flags).
+# Optional: METRIC, EXTRA (array of extra flags), and WARN.
+#
+# WARN is the value for the cohort that should come out WARNING rather than critical —
+# over the rule's warning threshold, under its critical one. A script that sets it gets a
+# split group by default: WARN_PCT of the entities warning (33 unless the script says
+# otherwise), the rest critical. Every knob is env-overridable per run — WARN_N or WARN_PCT
+# move the line (WARN_N=0 is the old all-critical behaviour), WARN moves the value — and a
+# script that sets no WARN at all has no warning tier, because its signal has no middle
+# value: a pod is Running or it is Failed.
+#
+# SEV_FLAP makes that split MOVE instead of holding still: every SEV_FLAP the warning cohort
+# walks the multipliers in SEV_WAVE and the critical cohort takes the rest, so members
+# escalate and de-escalate while the same entities keep breaching. Any script here accepts
+# it; mixed-severity-group.sh sets it by default. Keep it longer than the rule's evaluation
+# window or every member just averages the two values and settles on neither severity.
+#
+# The values here are educated guesses at where each rule's two thresholds sit — that is
+# not something the data can tell you. If a cohort lands on the wrong severity in the UI,
+# WARN= is the knob, not a code change.
 # Overridable per run by env or by the two positional args: N and DURATION.
 run_alert() {
   # Precedence for both knobs: env var, then positional arg, then the script's default.
@@ -62,9 +102,51 @@ run_alert() {
   local n=${N:-${ARGS[0]:-${DEFAULT_N:-200}}}
   local duration=${DURATION:-${ARGS[1]:-${DEFAULT_DURATION:-45m}}}
   local prefix; prefix=$(mk_prefix "$TAG")
-  local cmd=("$BIN" -signal "$SIGNAL" -prefix "$prefix" -n "$n" -breach "$n"
+
+  # Severity split. Every entity still breaches; WARN_N of them breach only as far as the
+  # warning threshold. A third is enough to be unmissable in the group without making the
+  # critical count look thin.
+  local warn_n=0 spread_sev="all breaching"
+  if [[ -n ${WARN:-} && ${HEALTHY:-0} != 1 ]]; then
+    # Rounded, so the documented "a third" is a third rather than a floor.
+    warn_n=${WARN_N:-$(( (n * ${WARN_PCT:-33} + 50) / 100 ))}
+    if (( warn_n < 0 || warn_n > n )); then
+      echo "ERROR: WARN_N=$warn_n is not between 0 and N=$n" >&2
+      exit 1
+    fi
+    spread_sev="all breaching: $(( n - warn_n )) critical, $warn_n warning"
+  fi
+  # HEALTHY=1 sends the whole fleet at OK and fires nothing — for the profiles that emit a
+  # host's full metric set, where the point is populating the pages rather than alerting.
+  local crit=$(( n - warn_n ))
+  local values_desc="healthy $OK${WARN:+, warning $WARN}, critical $BAD"
+  if [[ ${HEALTHY:-0} == 1 ]]; then
+    crit=0 warn_n=0 spread_sev="none breaching (HEALTHY=1)"
+    values_desc="healthy $OK, and nothing else is sent"
+  fi
+
+  # The severity wave, spelled out as the counts it will actually produce — the multipliers
+  # on their own ("1,0.5,1,1.5") tell you nothing about what the group will look like.
+  # SEV_FLAP=0 (or 0s) is how a caller turns the movement off, so treat it as unset rather
+  # than announcing a wave that will never move.
+  local sev_flap=${SEV_FLAP:-} wave_desc=""
+  [[ $sev_flap =~ ^0[a-z]*$ ]] && sev_flap=""
+  if [[ -n $sev_flap ]] && (( warn_n > 0 )) && [[ ${HEALTHY:-0} != 1 ]]; then
+    wave_desc=$(awk -v w="$warn_n" -v t="$n" -v spec="${SEV_WAVE:-1,0.5,1,1.5}" 'BEGIN{
+      k = split(spec, m, ",")
+      for (i = 1; i <= k; i++) {
+        x = int(w * m[i] + 0.5); if (x > t) x = t
+        out = out (i > 1 ? " -> " : "") (t - x) "c/" x "w"
+      }
+      print out }')
+  fi
+
+  local cmd=("$BIN" -signal "$SIGNAL" -prefix "$prefix" -n "$n" -breach "$crit"
              -ok "$OK" -bad "$BAD" -interval "$INTERVAL" -duration "$duration"
              -endpoint "$ENDPOINT")
+  [[ -n ${WARN:-} ]] && cmd+=(-warn "$WARN" -warn-n "$warn_n")
+  [[ -n $sev_flap ]] && cmd+=(-sev-flap "$sev_flap")
+  [[ -n ${SEV_WAVE:-} ]] && cmd+=(-sev-wave "$SEV_WAVE")
   [[ -n ${METRIC:-} ]] && cmd+=(-metric "$METRIC")
   [[ -n ${EXTRA:-} ]] && cmd+=("${EXTRA[@]}")
 
@@ -72,13 +154,15 @@ run_alert() {
   cat >&2 <<INFO
 ------------------------------------------------------------------------------
   WATCH     : rule "$ALERT"  ->  Alerts > History
-  entities  : $n, all breaching
+  entities  : $n, $spread_sev
   prefix    : $prefix
-  values    : healthy $OK, breaching $BAD${SPREAD:+
+  values    : $values_desc${wave_desc:+
+  wave      : split moves every $sev_flap: $wave_desc}${SPREAD:+
   spread    : $SPREAD}
   note      : $NOTE
   duration  : $duration  (interval $INTERVAL)
   endpoint  : $ENDPOINT
+  creds     : ${ENV_FILE#"$REPO/"}${shell_key:+ (MW_API_KEY overridden in the shell)}
 ------------------------------------------------------------------------------
   Ctrl-C at any time: a final all-healthy batch is sent so the alert resolves
   instead of being left permanently breaching.
@@ -111,6 +195,14 @@ parse_args() {
         echo "usage: $(basename "$0") [N] [DURATION] [--bg] [--dry-run]"
         echo "  N         how many entities breach   (default $DEFAULT_N)"
         echo "  DURATION  how long to keep breaching (default $DEFAULT_DURATION)"
+        if [[ -n ${WARN:-} ]]; then
+          echo "env:"
+          echo "  WARN_N    how many of the N are only WARNING, not critical (default ${WARN_PCT:-33}% of N)"
+          echo "  WARN_PCT  the same as a percentage of N (default ${WARN_PCT:-33})"
+          echo "  WARN      the value that cohort emits (default $WARN)"
+          echo "  SEV_FLAP  move the split every this often${SEV_FLAP:+ (default $SEV_FLAP)}, so members escalate and de-escalate"
+          echo "  SEV_WAVE  the cycle it walks, as multiples of WARN_N (default ${SEV_WAVE:-1,0.5,1,1.5})"
+        fi
         exit 0;;
       *) ARGS+=("$1");;
     esac
