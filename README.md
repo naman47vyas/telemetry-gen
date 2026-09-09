@@ -24,6 +24,8 @@ MW_API_KEY=… ./telemetrygen -n 500 -breach 37
 | `-flap` | 0 | rotate the breaching window every so often (cooldown / re-arm tests) |
 | `-sev-flap` | 0 | move the critical/warning split every so often, same entities breaching throughout — members escalate and de-escalate inside one group |
 | `-sev-wave` | 1,0.5,1,1.5 | the cycle `-sev-flap` walks, as multiples of `-warn-n` |
+| `-tier-wave` | | the cycle as SEVERITIES the whole cohort walks instead (`crit,warn,ok,warn`) — this one goes healthy, so the alert resolves and fires again |
+| `-tier-phases` | 1 | split the cohort into this many groups entering `-tier-wave` at different points (1 = lockstep) |
 | `-churn` | 0 | retire + re-mint this many per interval — new `container.id` and name, i.e. brand-new groups (ephemeral-pod behaviour) |
 | `-hosts` | 1 | spread containers over N synthetic hosts (`notify_by: ["host.name"]` tests) |
 | `-prefix` | synth | names: `synth-container-0001`, `synth-host-01` |
@@ -91,6 +93,12 @@ member's severity changes without it joining or leaving the group. Keep the peri
 than the rule's evaluation window — a member that alternates faster than the window just
 averages the two values and reads as neither severity.
 
+`-tier-wave` is the other cycle, and the two are mutually exclusive. Where `-sev-wave`
+rearranges severities inside a group that stays open, `-tier-wave` walks the whole cohort
+through named tiers — `crit,warn,ok,warn` — including HEALTHY, so the rule fires,
+de-escalates, resolves and fires again. `-tier-phases` splits the fleet into groups entering
+that cycle at different points, which trades the resolve for a group that always holds a mix.
+
 ## Scenarios
 
 | goal | command |
@@ -106,6 +114,7 @@ averages the two values and reads as neither severity.
 | one group, both severities | `-n 200 -breach 134 -warn-n 66` |
 | members escalating and de-escalating | `-n 40 -breach 20 -warn-n 20 -sev-flap 10m` |
 | hosts with a populated host page | `-signal host.full -n 25 -breach 0` |
+| an alert firing, resolving and firing again | `-signal host.full -n 25 -breach 25 -sev-flap 10m -tier-wave crit,warn,ok,warn` |
 
 Pair with the threshold trick (lower the rule's threshold) when you want breaches
 without caring about absolute values.

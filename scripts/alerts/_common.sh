@@ -85,11 +85,21 @@ mk_prefix() { printf 'ma-%s-%d%02d' "$1" "$(( $(date +%s) % 1000000 ))" "$(( RAN
 # script that sets no WARN at all has no warning tier, because its signal has no middle
 # value: a pod is Running or it is Failed.
 #
-# SEV_FLAP makes that split MOVE instead of holding still: every SEV_FLAP the warning cohort
-# walks the multipliers in SEV_WAVE and the critical cohort takes the rest, so members
-# escalate and de-escalate while the same entities keep breaching. Any script here accepts
-# it; mixed-severity-group.sh sets it by default. Keep it longer than the rule's evaluation
-# window or every member just averages the two values and settles on neither severity.
+# SEV_FLAP makes that split MOVE instead of holding still. What it walks depends on which
+# cycle you give it, and they are mutually exclusive:
+#
+#   SEV_WAVE   multipliers of the warning count. The split moves, everything keeps
+#              breaching, and the group stays open the whole time — members escalate and
+#              de-escalate inside one notification.
+#   TIER_WAVE  severities the whole cohort walks: crit,warn,ok,warn. This one goes HEALTHY,
+#              so the alert resolves and fires again — the whole life of an alert rather
+#              than a rearrangement inside one open group. TIER_PHASES splits the fleet
+#              into groups entering the cycle at different points, if you would rather the
+#              group always held a mix than have everything move in lockstep.
+#
+# Any script here accepts them; mixed-severity-group.sh sets SEV_WAVE and
+# full-host-metrics-wave.sh sets TIER_WAVE. Keep SEV_FLAP longer than the rule's evaluation
+# window either way, or every member just averages its values and settles on nothing.
 #
 # The values here are educated guesses at where each rule's two thresholds sit — that is
 # not something the data can tell you. If a cohort lands on the wrong severity in the UI,
@@ -129,16 +139,33 @@ run_alert() {
   # on their own ("1,0.5,1,1.5") tell you nothing about what the group will look like.
   # SEV_FLAP=0 (or 0s) is how a caller turns the movement off, so treat it as unset rather
   # than announcing a wave that will never move.
-  local sev_flap=${SEV_FLAP:-} wave_desc=""
+  local sev_flap=${SEV_FLAP:-} wave_desc="" wave_label="split moves"
   [[ $sev_flap =~ ^0[a-z]*$ ]] && sev_flap=""
-  if [[ -n $sev_flap ]] && (( warn_n > 0 )) && [[ ${HEALTHY:-0} != 1 ]]; then
-    wave_desc=$(awk -v w="$warn_n" -v t="$n" -v spec="${SEV_WAVE:-1,0.5,1,1.5}" 'BEGIN{
-      k = split(spec, m, ",")
-      for (i = 1; i <= k; i++) {
-        x = int(w * m[i] + 0.5); if (x > t) x = t
-        out = out (i > 1 ? " -> " : "") (t - x) "c/" x "w"
-      }
-      print out }')
+  if [[ -n $sev_flap && ${HEALTHY:-0} != 1 ]]; then
+    if [[ -n ${TIER_WAVE:-} ]]; then
+      # In this mode the critical/warning split is not what moves — the whole cohort does,
+      # so say that rather than leaving the entities line claiming a split that never holds.
+      wave_label="fleet moves"
+      spread_sev="all on one cycle"
+      (( ${TIER_PHASES:-1} > 1 )) && spread_sev="all on one cycle, in ${TIER_PHASES} phase groups"
+      # Spell the tiers out in full: "crit" in a banner is too easy to read past.
+      wave_desc=$(awk -v spec="$TIER_WAVE" -v p="${TIER_PHASES:-1}" 'BEGIN{
+        k = split(spec, t, ",")
+        for (i = 1; i <= k; i++) {
+          gsub(/^ +| +$/, "", t[i])
+          n = (t[i] ~ /^c/) ? "all critical" : (t[i] ~ /^w/) ? "all warning" : "all healthy"
+          out = out (i > 1 ? " -> " : "") n
+        }
+        print out (p > 1 ? " (in " p " phase groups, so the fleet is never all one thing)" : "") }')
+    elif (( warn_n > 0 )); then
+      wave_desc=$(awk -v w="$warn_n" -v t="$n" -v spec="${SEV_WAVE:-1,0.5,1,1.5}" 'BEGIN{
+        k = split(spec, m, ",")
+        for (i = 1; i <= k; i++) {
+          x = int(w * m[i] + 0.5); if (x > t) x = t
+          out = out (i > 1 ? " -> " : "") (t - x) "c/" x "w"
+        }
+        print out }')
+    fi
   fi
 
   local cmd=("$BIN" -signal "$SIGNAL" -prefix "$prefix" -n "$n" -breach "$crit"
@@ -147,6 +174,8 @@ run_alert() {
   [[ -n ${WARN:-} ]] && cmd+=(-warn "$WARN" -warn-n "$warn_n")
   [[ -n $sev_flap ]] && cmd+=(-sev-flap "$sev_flap")
   [[ -n ${SEV_WAVE:-} ]] && cmd+=(-sev-wave "$SEV_WAVE")
+  [[ -n ${TIER_WAVE:-} ]] && cmd+=(-tier-wave "$TIER_WAVE")
+  [[ -n ${TIER_PHASES:-} ]] && cmd+=(-tier-phases "$TIER_PHASES")
   [[ -n ${METRIC:-} ]] && cmd+=(-metric "$METRIC")
   [[ -n ${EXTRA:-} ]] && cmd+=("${EXTRA[@]}")
 
@@ -157,7 +186,7 @@ run_alert() {
   entities  : $n, $spread_sev
   prefix    : $prefix
   values    : $values_desc${wave_desc:+
-  wave      : split moves every $sev_flap: $wave_desc}${SPREAD:+
+  wave      : $wave_label every $sev_flap: $wave_desc}${SPREAD:+
   spread    : $SPREAD}
   note      : $NOTE
   duration  : $duration  (interval $INTERVAL)
@@ -202,6 +231,11 @@ parse_args() {
           echo "  WARN      the value that cohort emits (default $WARN)"
           echo "  SEV_FLAP  move the split every this often${SEV_FLAP:+ (default $SEV_FLAP)}, so members escalate and de-escalate"
           echo "  SEV_WAVE  the cycle it walks, as multiples of WARN_N (default ${SEV_WAVE:-1,0.5,1,1.5})"
+          if [[ -n ${TIER_WAVE:-} ]]; then
+            echo "  TIER_WAVE severities the whole cohort walks, healthy included (default $TIER_WAVE)"
+            echo "  TIER_PHASES  split the fleet into this many groups at different points (default ${TIER_PHASES:-1})"
+          fi
+          echo "  HEALTHY=1 send the whole fleet at OK and fire nothing"
         fi
         exit 0;;
       *) ARGS+=("$1");;

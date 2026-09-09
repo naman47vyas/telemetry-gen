@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,6 +71,71 @@ func statesSum(ms []*metricspb.Metric, name string) float64 {
 			continue
 		}
 		total += m.GetGauge().DataPoints[0].GetAsDouble()
+	}
+	return total
+}
+
+// The tier wave has to actually reach HEALTHY: that step is the whole reason it exists,
+// and a cycle that never stops breaching is a cycle whose alert never resolves.
+func TestTierWaveWalksAllThreeTiers(t *testing.T) {
+	cfg := config{signal: "host.full", n: 8, breach: 8, ok: 0.05, warn: 0.87, bad: 0.96,
+		// Three ticks to a step, as in a real run where the step is a rule window and the
+		// interval is ten seconds. A step equal to the interval is the degenerate case: the
+		// first entry of the cycle is held for [start, start+step), which is no ticks at all.
+		interval: 10 * time.Second, sevFlap: 30 * time.Second, tierWave: "crit,warn,ok,warn",
+		sevWave: sevWaveDefault, tierPhases: 1, prefix: "t", hosts: 1, clusters: 1, spans: 4}
+	now := time.Now()
+	g := newGenerator(cfg, now)
+
+	var seen []string
+	for tick := 1; tick <= 13; tick++ {
+		b := g.tick(now.Add(time.Duration(tick)*cfg.interval), false)
+		switch {
+		case b.bad == cfg.n && b.warn == 0:
+			seen = append(seen, "crit")
+		case b.warn == cfg.n && b.bad == 0:
+			seen = append(seen, "warn")
+		case b.bad == 0 && b.warn == 0:
+			seen = append(seen, "ok")
+		default:
+			t.Fatalf("tick %d is a mix (%d critical, %d warning); lockstep should be all one tier", tick, b.bad, b.warn)
+		}
+		if n := len(seen); n > 1 && seen[n-1] == seen[n-2] {
+			seen = seen[:n-1] // same step, still; only the transitions are interesting
+		}
+		// Whatever the tier, the four states the host CPU rule sums must still add up to
+		// exactly the value for that tier — including the healthy one, or the resolve is
+		// a resolve to some other number.
+		for _, rm := range b.metrics.ResourceMetrics {
+			want := map[string]float64{"crit": cfg.bad, "warn": cfg.warn, "ok": cfg.ok}[seen[len(seen)-1]]
+			if got := formulaSum(rm.ScopeMetrics[0].Metrics); math.Abs(got-want) > 1e-9 {
+				t.Fatalf("tick %d: cpu formula is %v, want %v", tick, got, want)
+			}
+		}
+	}
+	got := strings.Join(seen, ",")
+	if want := "crit,warn,ok,warn,crit"; got != want {
+		t.Errorf("cycle walked %s, want %s", got, want)
+	}
+}
+
+// formulaSum is what "High CPU usage for host" evaluates: user + system + wait + steal.
+func formulaSum(ms []*metricspb.Metric) float64 {
+	total := 0.0
+	for _, m := range ms {
+		if m.Name != "system.cpu.utilization" || m.GetGauge() == nil {
+			continue
+		}
+		dp := m.GetGauge().DataPoints[0]
+		for _, a := range dp.Attributes {
+			if a.Key != "state" {
+				continue
+			}
+			switch a.Value.GetStringValue() {
+			case "user", "system", "wait", "steal":
+				total += dp.GetAsDouble()
+			}
+		}
 	}
 	return total
 }

@@ -96,6 +96,7 @@ synthetic node belongs to exactly one cluster. Defaults are 3 clusters and 5 nam
 | `errors-detected-in-traces.sh` | Errors detected in traces | `service.name` | 100% / 15% |
 | `mixed-severity-group.sh` | High CPU usage for host (severity mix, on the move) | `host.name` | 96% / 87% |
 | `full-host-metrics.sh` | High CPU usage for host (or nothing, with `HEALTHY=1`) | `host.name` | 96% / 87% |
+| `full-host-metrics-wave.sh` | High CPU usage for host, firing and resolving on a cycle | `host.name` | 96% / 87% / 5% |
 
 The two enum rules have no warning column: `k8s.pod.phase` and `container.status` have no
 value between Running and Failed, so every member of those groups is critical.
@@ -127,6 +128,40 @@ of the run, so rate charts need a couple of intervals before they show anything.
 One host here is ~100 datapoints where a host elsewhere is one, so `N` costs a hundred times
 as much — 25 hosts is 2500 datapoints an interval, 200 hosts is 20000. The sender chunks on
 datapoints rather than resources so requests stay under gRPC's limit either way.
+
+## An alert's whole life, on a cycle
+
+`full-host-metrics-wave.sh` is `full-host-metrics.sh` with the fleet walking a cycle instead
+of holding one level. Every `SEV_FLAP` all 25 hosts move to the next severity:
+
+```
+critical -> warning -> healthy -> warning -> (round again)
+```
+
+so the rule fires critical, de-escalates to warning, **resolves**, then climbs back and
+fires again. That healthy step is the whole difference from `mixed-severity-group.sh`, whose
+wave only rearranges severities inside a group that stays open. Use this one for
+notification history, resolve behaviour, cooldown and re-arm.
+
+```sh
+./full-host-metrics-wave.sh                          # 25 hosts, 40m cycle, 3 times round
+TIER_WAVE=crit,ok ./full-host-metrics-wave.sh        # just fire and resolve
+TIER_PHASES=4 ./full-host-metrics-wave.sh            # always mixed, never resolves
+```
+
+The hosts are the same full-fidelity machines, so the host pages stay populated through
+every step, healthy ones included.
+
+**Each step has to outlast the rule's window.** At anything under 5 minutes the window
+straddles two steps, every host averages 96% and 5%, and nothing reads as anything.
+`SEV_FLAP` defaults to 10m, so the cycle is 40 minutes and `DURATION` defaults to three of
+them. Expect the UI to lag each step by up to a window — the resolve does not land the
+moment the values drop.
+
+`TIER_PHASES=4` splits the fleet into four groups entering the cycle at different points, so
+some hosts are critical, some warning and some healthy at any moment while each still walks
+the whole cycle. The trade is that the aggregate counts barely move and the alert never
+resolves, because somebody is always breaching. Lockstep is the one that shows a close.
 
 ## Credentials — i.e. which project a run lands in
 

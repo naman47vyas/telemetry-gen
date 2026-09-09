@@ -74,7 +74,8 @@ type config struct {
 	ok, bad, warn                float64
 	interval, duration, flap     time.Duration
 	sevFlap                      time.Duration
-	sevWave                      string
+	sevWave, tierWave            string
+	tierPhases                   int
 	recoverOnExit, dryRun        bool
 	tls, plaintext               bool
 	hostName                     string
@@ -573,7 +574,8 @@ type generator struct {
 	startedOn  int64
 	nextFlap   time.Time
 	wave       []float64 // -sev-wave, the multiples of -warn-n the split walks through
-	sevStep    int       // where in that wave this tick is
+	tiers      []int     // -tier-wave, the severities the fleet itself walks through
+	sevStep    int       // where in either wave this tick is
 	nextSev    time.Time
 }
 
@@ -587,9 +589,31 @@ func newGenerator(cfg config, now time.Time) *generator {
 	}
 	if cfg.sevFlap > 0 {
 		g.wave = parseWave(cfg.sevWave)
+		g.tiers = parseTiers(cfg.tierWave)
 		g.nextSev = now.Add(cfg.sevFlap)
 	}
 	return g
+}
+
+// parseTiers reads -tier-wave: the severities the breaching cohort walks through, in order.
+func parseTiers(spec string) []int {
+	if spec == "" {
+		return nil
+	}
+	var out []int
+	for _, f := range strings.Split(spec, ",") {
+		switch strings.ToLower(strings.TrimSpace(f)) {
+		case "crit", "critical":
+			out = append(out, sevCritical)
+		case "warn", "warning":
+			out = append(out, sevWarning)
+		case "ok", "healthy":
+			out = append(out, sevHealthy)
+		default:
+			log.Fatalf("-tier-wave %q: %q is not crit, warn or ok", spec, f)
+		}
+	}
+	return out
 }
 
 // parseWave reads -sev-wave: multiples of -warn-n, one per step of the severity cycle.
@@ -622,6 +646,10 @@ func (g *generator) cohorts() (crit, warn int) {
 // The three tiers an entity can be in on a given tick. A rule with two thresholds reports
 // the middle one as WARNING and the top one as CRITICAL, so a run that wants both severities
 // in one group sends some entities the -bad value and some the -warn value.
+// sevWaveDefault is the -sev-wave cycle; named so the -tier-wave check can tell an
+// untouched flag from one the caller set.
+const sevWaveDefault = "1,0.5,1,1.5"
+
 const (
 	sevHealthy = iota
 	sevWarning
@@ -631,6 +659,22 @@ const (
 // severity places entity i in one of the three tiers. The critical and warning cohorts are
 // adjacent windows starting at breachAt, so they rotate together on flap and a warning
 // entity becomes a healthy one rather than being reshuffled into the critical cohort.
+// tierFor walks entity i through -tier-wave. Unlike the -sev-wave split, this one includes
+// HEALTHY, so the cohort stops breaching entirely for a step and the alert resolves before
+// firing again — an alert's whole life rather than a rearrangement inside one open group.
+// The fleet rides the cycle in lockstep unless -tier-phases spreads it, in which case each
+// slice enters at a different point and the group holds a mix at every moment instead.
+func (g *generator) tierFor(i, participating int) int {
+	if i >= participating {
+		return sevHealthy
+	}
+	phase := 0
+	if g.cfg.tierPhases > 1 && participating > 0 {
+		phase = i * g.cfg.tierPhases / participating
+	}
+	return g.tiers[(g.sevStep+phase)%len(g.tiers)]
+}
+
 func (g *generator) severity(i, crit, warn int) int {
 	pos := (i - g.breachAt + g.cfg.n) % g.cfg.n
 	switch {
@@ -701,7 +745,11 @@ func (g *generator) tick(now time.Time, allOK bool) *batch {
 	for i, c := range g.containers {
 		v := g.cfg.ok
 		if !allOK {
-			switch g.severity(i, crit, warn) {
+			sev := g.severity(i, crit, warn)
+			if len(g.tiers) > 0 {
+				sev = g.tierFor(i, crit+warn)
+			}
+			switch sev {
 			case sevCritical:
 				v = g.cfg.bad
 				b.bad++
@@ -831,7 +879,9 @@ func main() {
 	flag.DurationVar(&cfg.duration, "duration", 0, "stop after this long (0 = until Ctrl-C)")
 	flag.DurationVar(&cfg.flap, "flap", 0, "rotate which containers breach every this often (0 = never)")
 	flag.DurationVar(&cfg.sevFlap, "sev-flap", 0, "move the critical/warning split every this often, keeping the same entities breaching (0 = a fixed split)")
-	flag.StringVar(&cfg.sevWave, "sev-wave", "1,0.5,1,1.5", "-sev-flap cycle, as multiples of -warn-n: the warning cohort walks these and the critical one takes the rest")
+	flag.StringVar(&cfg.sevWave, "sev-wave", sevWaveDefault, "-sev-flap cycle, as multiples of -warn-n: the warning cohort walks these and the critical one takes the rest")
+	flag.StringVar(&cfg.tierWave, "tier-wave", "", "-sev-flap cycle as SEVERITIES the whole cohort walks instead (crit,warn,ok,warn): unlike -sev-wave this one goes healthy, so the alert resolves and fires again")
+	flag.IntVar(&cfg.tierPhases, "tier-phases", 1, "split the cohort into this many groups entering -tier-wave at different points (1 = the whole fleet in lockstep)")
 	flag.BoolVar(&cfg.recoverOnExit, "recover-on-exit", true, "send a final all-healthy batch on exit so groups resolve")
 	flag.BoolVar(&cfg.tls, "tls", false, "force TLS (auto-enabled for https:// endpoints and port 443)")
 	flag.BoolVar(&cfg.plaintext, "plaintext", false, "force plaintext, overriding the TLS auto-detection")
@@ -872,7 +922,18 @@ func main() {
 	if cfg.breach+cfg.warnN > cfg.n {
 		log.Fatalf("-breach %d + -warn-n %d exceeds -n %d", cfg.breach, cfg.warnN, cfg.n)
 	}
-	if cfg.sevFlap > 0 {
+	if cfg.tierWave != "" {
+		if cfg.sevFlap <= 0 {
+			log.Fatal("-tier-wave is a cycle; -sev-flap says how long each step lasts")
+		}
+		if cfg.sevWave != sevWaveDefault {
+			log.Fatal("-sev-wave and -tier-wave are two different cycles; pass one or the other")
+		}
+		if cfg.tierPhases < 1 {
+			log.Fatal("-tier-phases must be >= 1")
+		}
+	}
+	if cfg.sevFlap > 0 && cfg.tierWave == "" {
 		if cfg.warnN <= 0 {
 			log.Fatal("-sev-flap moves the critical/warning split, so it needs a warning cohort: pass -warn-n")
 		}
